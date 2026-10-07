@@ -1,0 +1,118 @@
+# Passkey sign-in for self-hosted admin apps: Pocket ID (passkeys only, no
+# passwords) is the identity provider, oauth2-proxy the forward-auth gate the
+# edge asks before it serves a protected route.
+#
+# Packaged for Launchway: it sets the project name and joins the routed
+# services to its proxy network. Every setting is an environment variable of
+# the app (README.md); required ones stop `docker compose config` when unset.
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: 10m
+    max-file: "5"
+
+services:
+  # The identity provider at https://${LOGIN_HOST}.
+  pocket-id:
+    # 2.x: minor releases stay compatible
+    image: ghcr.io/pocket-id/pocket-id:v2
+    restart: unless-stopped
+    environment:
+      TZ: ${TZ:-Europe/Brussels}
+      # also the passkeys' relying party: keep it when migrating
+      APP_URL: https://${LOGIN_HOST:?LOGIN_HOST is required}
+      # X-Forwarded-For from the edge only
+      TRUST_PROXY: ${TRUSTED_PROXY_IP:-10.210.0.2}
+      # encrypts the signing keys at rest
+      ENCRYPTION_KEY: ${POCKET_ID_ENCRYPTION_KEY:?POCKET_ID_ENCRYPTION_KEY is required}
+      # admin API key for automation (header X-API-KEY); empty disables it
+      STATIC_API_KEY: ${POCKET_ID_STATIC_API_KEY:-}
+      # the look and the rules are configuration, not clicks in the admin pages
+      UI_CONFIG_DISABLED: "true"
+      APP_NAME: ${LOGIN_APP_NAME:-Pocket ID}
+      ACCENT_COLOR: ${LOGIN_ACCENT_COLOR:-default}
+      ALLOW_USER_SIGNUPS: disabled
+      ALLOW_INSECURE_CALLBACK_URLS: "false"
+      ANALYTICS_DISABLED: "true"
+      # the entrypoint hands /app/data to this user, then drops to it
+      PUID: "1000"
+      PGID: "1000"
+    ports:
+      # admin API for a bootstrap script, on this machine only
+      - "127.0.0.1:20014:1411"
+    volumes:
+      # the accounts, their passkeys and the signing keys (SQLite)
+      - pocket-id-data:/app/data
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop: [ALL]
+    # only for the entrypoint's chown of /app/data and its switch to PUID:PGID
+    cap_add: [CHOWN, SETUID, SETGID]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 256m
+    healthcheck:
+      test: ["CMD", "/app/pocket-id", "healthcheck"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+    logging: *logging
+
+  # Forward auth: checks the session cookie and sends anyone without one
+  # through Pocket ID. No published port; the edge asks it.
+  oauth2-proxy:
+    # no floating major tag exists; Dependabot proposes updates. The alpine
+    # variant has the wget of the healthcheck.
+    image: quay.io/oauth2-proxy/oauth2-proxy:v7.15.5-alpine
+    restart: unless-stopped
+    depends_on:
+      # it reads Pocket ID's discovery document when it starts
+      pocket-id:
+        condition: service_healthy
+    environment:
+      OAUTH2_PROXY_PROVIDER: oidc
+      OAUTH2_PROXY_PROVIDER_DISPLAY_NAME: ${LOGIN_APP_NAME:-Pocket ID}
+      OAUTH2_PROXY_OIDC_ISSUER_URL: https://${LOGIN_HOST}
+      OAUTH2_PROXY_REDIRECT_URL: https://${OAUTH2_HOST:-${LOGIN_HOST}}/oauth2/callback
+      OAUTH2_PROXY_CLIENT_ID: ${OAUTH2_PROXY_CLIENT_ID:?OAUTH2_PROXY_CLIENT_ID is required}
+      OAUTH2_PROXY_CLIENT_SECRET: ${OAUTH2_PROXY_CLIENT_SECRET:?OAUTH2_PROXY_CLIENT_SECRET is required}
+      OAUTH2_PROXY_SCOPE: openid email profile groups
+      OAUTH2_PROXY_CODE_CHALLENGE_METHOD: S256
+      # who gets in: members of this Pocket ID group (restrict the client to it, too)
+      OAUTH2_PROXY_EMAIL_DOMAINS: "*"
+      OAUTH2_PROXY_ALLOWED_GROUPS: ${ALLOWED_GROUPS:-admins}
+      # one session for every gated subdomain, a day long
+      OAUTH2_PROXY_COOKIE_NAME: __Secure-login_session
+      OAUTH2_PROXY_COOKIE_SECRET: ${OAUTH2_PROXY_COOKIE_SECRET:?OAUTH2_PROXY_COOKIE_SECRET is required}
+      OAUTH2_PROXY_COOKIE_DOMAINS: .${COOKIE_DOMAIN:?COOKIE_DOMAIN is required}
+      OAUTH2_PROXY_WHITELIST_DOMAINS: .${COOKIE_DOMAIN}
+      OAUTH2_PROXY_COOKIE_SECURE: "true"
+      OAUTH2_PROXY_COOKIE_SAMESITE: lax
+      OAUTH2_PROXY_COOKIE_EXPIRE: 24h
+      # the edge's X-Forwarded-* say where to return after signing in
+      OAUTH2_PROXY_REVERSE_PROXY: "true"
+      OAUTH2_PROXY_TRUSTED_PROXY_IPS: ${TRUSTED_PROXY_IP:-10.210.0.2}
+      OAUTH2_PROXY_SKIP_PROVIDER_BUTTON: "true"
+      OAUTH2_PROXY_UPSTREAMS: static://202
+      OAUTH2_PROXY_HTTP_ADDRESS: 0.0.0.0:4180
+      OAUTH2_PROXY_SILENCE_PING_LOGGING: "true"
+      OAUTH2_PROXY_FOOTER: "-"
+    extra_hosts:
+      # discovery and token requests go straight to the edge, not out and back in
+      - "${LOGIN_HOST}:${TRUSTED_PROXY_IP:-10.210.0.2}"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 128m
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:4180/ping"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+    logging: *logging
+
+volumes:
+  pocket-id-data:
